@@ -1,9 +1,18 @@
-/Twibot_20/backup_before_seed
-/Twibot_20/checkpoints
-/Twibot_20/feature_model_outputs
-/Twibot_20/saved_data
-/Twibot_20/swanlog
-/Twibot_20/tmp
-/Twibot_22/autodl_code_v2.zip
-/readme.md
-/.idea
+# 数据与产物（按模式，不按路径，防遗漏）
+*.pth
+*.pt
+*.npz
+*.npy
+saved_data/
+checkpoints/
+feature_model_outputs/
+tmp/
+tmp_twibot22*/
+tmp_v6*/
+swanlog/
+backup_before_seed/
+*.zip
+__pycache__/
+.idea/
+# 例外：实验结果表必须进版本库
+!experiments/results.csv
