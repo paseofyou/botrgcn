@@ -652,18 +652,8 @@ def main():
     best_val_acc = -1.0
     patience_counter = 0
     epochs_run = 0
-    # 为每个实验生成唯一的模型文件名，避免多版本/多 seed/多运行互相覆盖
-    checkpoint_dir = os.path.join(REPO_ROOT, "experiments", "checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
     suffix = args.save_suffix if args.save_suffix else ""
-    git_short = git_state.split('-')[0]
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    best_model_name = (
-        f"best_model_twibot22_{args.model}{suffix}_seed{args.seed}_{git_short}_{timestamp}.pth"
-    )
-    best_model_path = os.path.join(checkpoint_dir, best_model_name)
-    print(f"最佳模型将保存到: {best_model_path}")
+    best_model_path = os.path.join(args.work_dir, f"best_model_twibot22{suffix}.pth")
 
     for epoch in range(args.epochs):
         # E2E 预热结束: 解冻 Transformer
