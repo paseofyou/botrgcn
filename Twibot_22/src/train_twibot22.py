@@ -229,9 +229,12 @@ def main():
     print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
 
     # ------------------- 加载时序特征 -------------------
-    # 构建 user_id → graph_index 映射 (E2E 和非 E2E 都需要)
-    ordered_user_ids = list(np.load(user_ids_path, allow_pickle=True))
-    id_to_idx = {str(uid): i for i, uid in enumerate(ordered_user_ids)}
+    # 构建 user_id → graph_index 映射 (pure 模式不需要)
+    if args.model == "pure":
+        id_to_idx = None
+    else:
+        ordered_user_ids = list(np.load(user_ids_path, allow_pickle=True))
+        id_to_idx = {str(uid): i for i, uid in enumerate(ordered_user_ids)}
 
     if args.model == "pure":
         # === 纯净基线: 完全不涉及时序, 连 npz 都不读 ===
