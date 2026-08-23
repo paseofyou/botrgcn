@@ -14,5 +14,6 @@ backup_before_seed/
 *.zip
 __pycache__/
 .idea/
+readme.md
 # 例外：实验结果表必须进版本库
 !experiments/results.csv
