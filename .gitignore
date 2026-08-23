@@ -11,9 +11,8 @@ tmp_twibot22*/
 tmp_v6*/
 swanlog/
 backup_before_seed/
+experiments/        # 实验结果 csv 由 --results-csv 指定, 不强制入版本库
 *.zip
 __pycache__/
 .idea/
 readme.md
-# 例外：实验结果表必须进版本库
-!experiments/results.csv
