@@ -11,10 +11,14 @@ TwiBot-22 训练脚本 — 适配 TwiBot-22 预处理数据
 import os
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import sys
+import csv
 import math
 import random
 import argparse
 import copy
+import datetime
+import subprocess
+import traceback
 
 import torch
 from torch import nn
@@ -45,11 +49,14 @@ class FocalLoss(nn.Module):
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, matthews_corrcoef, precision_score, recall_score
 
-from model import BotRGCN, BotRGCN_v2, BotRGCN_v3, BotRGCN_E2E, info_nce_loss
+from model import BotRGCN, BotRGCN_Pure, BotRGCN_v2, BotRGCN_v3, BotRGCN_E2E, info_nce_loss
 from utils import accuracy, init_weights
 
 # ------------------- 参数配置 -------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 仓库根目录 (Twibot_22/src → 上两级)，实验结果表放这里以便随代码一起版本控制
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+DEFAULT_RESULTS_CSV = os.path.join(REPO_ROOT, "experiments", "results.csv")
 
 
 def set_seed(seed=42):
@@ -64,10 +71,43 @@ def set_seed(seed=42):
     print(f"随机种子已固定: {seed}")
 
 
+def get_git_state():
+    """
+    返回当前代码的 git 版本标识, 形如 'a1b2c3d' 或 'a1b2c3d-dirty'。
+    带 -dirty 后缀说明运行时工作区存在未提交改动, 该结果不可复现, 不应写入论文。
+    """
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+        return sha + ("-dirty" if dirty else "")
+    except Exception:
+        return "unknown"
+
+
+def append_result_row(csv_path, row):
+    """把一次运行的最终测试指标追加到 results.csv (不存在则建表头)。"""
+    try:
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        print(f"结果已记录: {csv_path}")
+    except Exception as e:
+        print(f"警告: 写入结果表失败 — {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="TwiBot-22 GNN 训练")
     parser.add_argument("--work-dir", default=SCRIPT_DIR, help="工作目录")
-    parser.add_argument("--model", default="v2", choices=["v1", "v2", "v3"], help="模型版本")
+    parser.add_argument("--model", default="v2", choices=["pure", "v1", "v2", "v3"],
+                        help="模型版本 (pure=纯净BotRGCN基线, 不使用任何时序特征)")
     parser.add_argument("--gnn-layers", type=int, default=3, help="v3: GNN层数")
     parser.add_argument("--gat-heads", type=int, default=4, help="v3: GAT注意力头数")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
@@ -77,8 +117,9 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.001)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=30, help="早停耐心值(基于 val F1)")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="梯度裁剪")
-    # parser.add_argument("--no-scheduler", action="store_true", help="禁用学习率调度器 (使用恒定lr)")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="梯度裁剪 (<=0 表示禁用)")
+    parser.add_argument("--no-scheduler", action="store_true",
+                        help="禁用学习率调度器 (使用恒定lr, 复现官方 BotRGCN 时需要)")
     parser.add_argument("--no-class-weight", action="store_true", help="禁用类别权重")
     parser.add_argument("--class-weight", type=str, default=None,
                         help="手动指定类别权重,格式: 'w0,w1' 如 '1.0,3.0'")
@@ -115,7 +156,12 @@ def main():
                         help="E2E: Transformer 冻结预热轮数 (前 K 轮只训练 GNN, 默认 10)")
     parser.add_argument("--ts-pretrained", type=str, default=None,
                         help="E2E: 预训练 Transformer 权重路径 (BotClassifier .pt), 用于热启动")
+    parser.add_argument("--results-csv", type=str, default=DEFAULT_RESULTS_CSV,
+                        help=f"实验结果汇总表路径 (默认: {DEFAULT_RESULTS_CSV})")
     args = parser.parse_args()
+
+    if args.model == "pure" and args.e2e:
+        parser.error("--model pure 与 --e2e 互斥: 纯净基线不含任何时序通路")
 
     set_seed(args.seed)
 
@@ -124,20 +170,28 @@ def main():
     print(f"模型版本: {args.model}")
     print(f"工作目录: {args.work_dir}")
 
+    # ------------------- 代码版本标识 -------------------
+    git_state = get_git_state()
+    run_name = f"BotRGCN_{args.model}{args.save_suffix}"
+    print(f"代码版本: {git_state}")
+    if git_state.endswith("-dirty"):
+        print("!!! 警告: 工作区存在未提交改动, 本次结果无法复现, 不要写入论文 !!!")
+
     # ------------------- 初始化 SwanLab -------------------
     # 将 argparse 的参数转换为字典，方便记录
     config_dict = vars(args)
     # 添加一些额外的配置信息
     config_dict['dataset'] = 'TwiBot-22'
     config_dict['class_weight_strategy'] = 'sqrt' if not args.no_class_weight else 'none'
-    
+    config_dict['git_commit'] = git_state
+
     # 初始化 SwanLab 实验
     # project: 项目名称，比如 "TwiBot22-BotDetection"
     # name: 本次实验的名称，可以用 save_suffix 区分
     # config: 记录超参数
     swanlab.init(
         project="TwiBot22-BotDetection",
-        name=f"BotRGCN_{args.model}{args.save_suffix}",
+        name=run_name,
         config=config_dict,
         logdir=os.path.join(args.work_dir, "swanlog")
     )
@@ -179,7 +233,12 @@ def main():
     ordered_user_ids = list(np.load(user_ids_path, allow_pickle=True))
     id_to_idx = {str(uid): i for i, uid in enumerate(ordered_user_ids)}
 
-    if args.e2e:
+    if args.model == "pure":
+        # === 纯净基线: 完全不涉及时序, 连 npz 都不读 ===
+        print("=== 纯净 BotRGCN 模式: 不加载任何时序特征 ===")
+        raw_ts_tensor = None
+        temporal_tensor = None
+    elif args.e2e:
         # === E2E 模式: 加载原始时间序列矩阵 ===
         print("=== E2E模式: 加载原始时间序列矩阵 ===")
         tmp_dir = args.e2e_matrix_dir or os.path.join(args.work_dir, "tmp_twibot22")
@@ -304,7 +363,14 @@ def main():
         print(f"  总参数量: {n_params:,}, 其中 Transformer: {n_ts_params:,}")
     else:
         print(f"=== 初始化模型: {args.model} ===")
-        if args.model == "v3":
+        if args.model == "pure":
+            model = BotRGCN_Pure(
+                num_prop_size=num_prop.shape[1],
+                cat_prop_size=cat_prop.shape[1],
+                embedding_dimension=args.embedding_size,
+                dropout=args.dropout
+            ).to(device)
+        elif args.model == "v3":
             model = BotRGCN_v3(
                 num_prop_size=num_prop.shape[1],
                 cat_prop_size=cat_prop.shape[1],
@@ -394,13 +460,17 @@ def main():
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # 计算总步数和 warmup 步数
-    total_steps = args.epochs
-    warmup_steps = int(total_steps * 0.1) # 10% 的时间用于 warmup
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, 
-        num_warmup_steps=warmup_steps, 
-        num_training_steps=total_steps
-    )
+    if args.no_scheduler:
+        scheduler = None
+        print("已禁用学习率调度器: 使用恒定 lr")
+    else:
+        total_steps = args.epochs
+        warmup_steps = int(total_steps * 0.1) # 10% 的时间用于 warmup
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
 
     # ------------------- 预计算有效索引 -------------------
     train_mask = labels[train_idx] >= 0
@@ -415,7 +485,10 @@ def main():
         - epoch < decay_start: 使用 base_weights (如 sqrt 权重)
         - decay_start <= epoch <= decay_end: 线性衰减到 [1.0, 1.0]
         - epoch > decay_end: 使用 [1.0, 1.0] (无权重)
+        若 base_weights 为 None (--no-class-weight), 则始终返回 None。
         """
+        if base_weights is None:
+            return None
         if epoch < decay_start:
             return base_weights
         elif epoch > decay_end:
@@ -428,6 +501,7 @@ def main():
 
     # ------------------- 训练 -------------------
     # 选择正确的时序输入
+    # pure 模式下 temporal_tensor 为 None, 模型内部会忽略该形参
     ts_input = raw_ts_tensor if args.e2e else temporal_tensor
     use_align = args.e2e and args.align_beta > 0
 
@@ -472,9 +546,8 @@ def main():
         if args.grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
-        
-        # 更新学习率
-        scheduler.step()
+        # 注意: scheduler.step() 统一在主训练循环中调用, 此处不要重复调用,
+        # 否则每个 epoch 会前进两步, 余弦周期提前走完。
 
         # 验证
         model.eval()
@@ -510,7 +583,7 @@ def main():
         
         return loss_train.item(), loss_val.item(), acc_val.item(), f1_val
 
-    def do_test():
+    def do_test(epochs_run, best_val_acc):
         model.eval()
         with torch.no_grad():
             output = model(des_tensor, tweets_tensor, num_prop, cat_prop,
@@ -548,10 +621,37 @@ def main():
                 "Test/MCC": mcc
             })
 
+            # 追加到实验结果汇总表 (受版本控制, 每行绑定一个 commit)
+            append_result_row(args.results_csv, {
+                "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_state,
+                "run_name": run_name,
+                "model": "e2e" if args.e2e else args.model,
+                "seed": args.seed,
+                "no_temporal": int(args.no_temporal),
+                "align_beta": args.align_beta,
+                "seq_len": args.seq_len if args.e2e else "",
+                "ts_layers": args.ts_layers if args.e2e else "",
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "dropout": args.dropout,
+                "embedding_size": args.embedding_size,
+                "scheduler": "none" if args.no_scheduler else "cosine_warmup",
+                "class_weight": "none" if args.no_class_weight else args.weight_mode,
+                "epochs_run": epochs_run,
+                "best_val_acc": round(float(best_val_acc), 4),
+                "test_acc": round(acc_test.item(), 4),
+                "precision": round(float(prec), 4),
+                "recall": round(float(rec), 4),
+                "f1": round(float(f1), 4),
+                "mcc": round(float(mcc), 4),
+            })
+
     # 训练循环
     train_losses, val_losses, val_f1s = [], [], []
     best_val_acc = -1.0
     patience_counter = 0
+    epochs_run = 0
     suffix = args.save_suffix if args.save_suffix else ""
     best_model_path = os.path.join(args.work_dir, f"best_model_twibot22{suffix}.pth")
 
@@ -571,13 +671,14 @@ def main():
             print(f"  Transformer lr 恢复为 {args.lr * args.ts_lr_scale:.2e}")
             print(f"  patience 计数器已重置\n")
 
+        epochs_run = epoch + 1
         tl, vl, va, vf1 = do_train(epoch)
         train_losses.append(tl)
         val_losses.append(vl)
         val_f1s.append(vf1)
         # warmup 期间不 step scheduler，让联合训练阶段拥有完整余弦周期
-        if not (args.e2e and args.ts_warmup_epochs > 0 and epoch < args.ts_warmup_epochs):
-        # if scheduler is not None and not (args.e2e and args.ts_warmup_epochs > 0 and epoch < args.ts_warmup_epochs):
+        if scheduler is not None and not (
+                args.e2e and args.ts_warmup_epochs > 0 and epoch < args.ts_warmup_epochs):
             scheduler.step()
 
         if va > best_val_acc:
@@ -593,7 +694,7 @@ def main():
 
     # 加载最佳模型并测试
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
-    do_test()
+    do_test(epochs_run, best_val_acc)
     
     # 结束 SwanLab 实验
     swanlab.finish()

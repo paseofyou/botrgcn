@@ -76,6 +76,56 @@ class BotRGCN(nn.Module):
         return x
 
 
+class BotRGCN_Pure(nn.Module):
+    """
+    纯净 BotRGCN 基线（路线 A：复现官方 BotRGCN）。
+    仅使用图结构 + 静态四模态，不含任何时序通路。
+
+    与官方实现对齐的要点：
+      1. 只有一个 RGCNConv，被调用两次（权重共享），而非两个独立层
+      2. 激活函数为 LeakyReLU，而非本项目 v1/v2 使用的 GELU
+      3. 不含 input_norm / time_norm 等额外归一化层
+      4. 输出层输入维度为 emb（非 emb + time_size）
+
+    forward 保留 time_feature 形参仅为与训练循环的调用签名兼容，内部完全不使用。
+    """
+
+    def __init__(self, des_size=768, tweet_size=768, num_prop_size=5, cat_prop_size=3,
+                 embedding_dimension=64, dropout=0.3):
+        super(BotRGCN_Pure, self).__init__()
+        self.dropout = dropout
+        emb = embedding_dimension
+
+        self.linear_relu_des = nn.Sequential(nn.Linear(des_size, emb // 4), nn.LeakyReLU())
+        self.linear_relu_tweet = nn.Sequential(nn.Linear(tweet_size, emb // 4), nn.LeakyReLU())
+        self.linear_relu_num_prop = nn.Sequential(nn.Linear(num_prop_size, emb // 4), nn.LeakyReLU())
+        self.linear_relu_cat_prop = nn.Sequential(nn.Linear(cat_prop_size, emb // 4), nn.LeakyReLU())
+
+        self.linear_relu_input = nn.Sequential(nn.Linear(emb, emb), nn.LeakyReLU())
+
+        self.rgcn = RGCNConv(emb, emb, num_relations=2)
+
+        self.linear_relu_output1 = nn.Sequential(nn.Linear(emb, emb), nn.LeakyReLU())
+        self.linear_output2 = nn.Linear(emb, 2)
+
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type):
+        d = self.linear_relu_des(des)
+        t = self.linear_relu_tweet(tweet)
+        n = self.linear_relu_num_prop(num_prop)
+        c = self.linear_relu_cat_prop(cat_prop)
+
+        x = torch.cat((d, t, n, c), dim=1)
+        x = self.linear_relu_input(x)
+
+        x = self.rgcn(x, edge_index, edge_type)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.rgcn(x, edge_index, edge_type)
+
+        x = self.linear_relu_output1(x)
+        x = self.linear_output2(x)
+        return x
+
+
 class BotRGCN_v2(nn.Module):
     """
     改进版 BotRGCN：
