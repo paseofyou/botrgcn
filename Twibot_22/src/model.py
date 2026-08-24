@@ -56,7 +56,8 @@ class BotRGCN(nn.Module):
             nn.Linear(embedding_dimension + time_size, embedding_dimension), nn.GELU())
         self.linear_output2 = nn.Linear(embedding_dimension, 2)
 
-    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type):
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type,
+                fusion_type=None):
         time_feature = self.time_norm(time_feature)
         d = self.linear_relu_des(des)
         t = self.linear_relu_tweet(tweet)
@@ -87,7 +88,7 @@ class BotRGCN_Pure(nn.Module):
       3. 不含 input_norm / time_norm 等额外归一化层
       4. 输出层输入维度为 emb（非 emb + time_size）
 
-    forward 保留 time_feature 形参仅为与训练循环的调用签名兼容，内部完全不使用。
+    forward 保留 time_feature / fusion_type 形参仅为与训练循环的调用签名兼容，内部完全不使用。
     """
 
     def __init__(self, des_size=768, tweet_size=768, num_prop_size=5, cat_prop_size=3,
@@ -108,7 +109,8 @@ class BotRGCN_Pure(nn.Module):
         self.linear_relu_output1 = nn.Sequential(nn.Linear(emb, emb), nn.LeakyReLU())
         self.linear_output2 = nn.Linear(emb, 2)
 
-    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type):
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type,
+                fusion_type=None):
         d = self.linear_relu_des(des)
         t = self.linear_relu_tweet(tweet)
         n = self.linear_relu_num_prop(num_prop)
@@ -156,10 +158,14 @@ class BotRGCN_v2(nn.Module):
 
         self.gate_linear = nn.Linear(emb * 2, emb)
 
+        # --- MLP 融合 (用于 w/o Graph 和 Concat 消融) ---
+        self.mlp_linear = nn.Linear(emb * 2, emb)
+
         self.output1 = nn.Sequential(nn.Linear(emb, emb), nn.GELU())
         self.output2 = nn.Linear(emb, 2)
 
-    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type):
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type,
+                fusion_type='gated'):
         t_proj = self.time_proj(time_feature)
 
         d = self.linear_relu_des(des)
@@ -167,16 +173,29 @@ class BotRGCN_v2(nn.Module):
         n = self.linear_relu_num_prop(num_prop)
         c = self.linear_relu_cat_prop(cat_prop)
 
-        x = torch.cat((d, t, n, c), dim=1)
-        x = self.linear_relu_input(x)
-        x = self.input_norm(x)
+        x_static = torch.cat((d, t, n, c), dim=1)
+        x_static = self.linear_relu_input(x_static)
+        x_static = self.input_norm(x_static)
 
-        x = self.rgcn1(x, edge_index, edge_type)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.rgcn2(x, edge_index, edge_type)
+        if fusion_type != 'no_graph':
+            x = self.rgcn1(x_static, edge_index, edge_type)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = self.rgcn2(x, edge_index, edge_type)
+        else:
+            x = x_static
 
-        gate = torch.sigmoid(self.gate_linear(torch.cat((x, t_proj), dim=1)))
-        x_fused = gate * x + (1 - gate) * t_proj
+        if fusion_type == 'no_graph':
+            # Time-only (w/o Graph): 静态特征 + 时序特征直接过 MLP
+            x_fused = F.gelu(self.mlp_linear(torch.cat((x_static, t_proj), dim=1)))
+        elif fusion_type == 'none':
+            # Graph-only: 完全不使用时序特征
+            x_fused = x
+        elif fusion_type == 'concat':
+            # 简单拼接融合替代门控
+            x_fused = F.gelu(self.mlp_linear(torch.cat((x, t_proj), dim=1)))
+        else:
+            gate = torch.sigmoid(self.gate_linear(torch.cat((x, t_proj), dim=1)))
+            x_fused = gate * x + (1 - gate) * t_proj
 
         x_fused = self.output1(x_fused)
         x_fused = self.output2(x_fused)
@@ -228,11 +247,15 @@ class BotRGCN_v3(nn.Module):
         # --- 门控融合 (同 v2) ---
         self.gate_linear = nn.Linear(emb * 2, emb)
 
+        # --- MLP 融合 (用于 w/o Graph 和 Concat 消融, 同 v2) ---
+        self.mlp_linear = nn.Linear(emb * 2, emb)
+
         # --- 输出层 ---
         self.output1 = nn.Sequential(nn.Linear(emb, emb), nn.GELU())
         self.output2 = nn.Linear(emb, 2)
 
-    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type):
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type,
+                fusion_type='gated'):
         t_proj = self.time_proj(time_feature)
 
         d = self.linear_relu_des(des)
@@ -240,25 +263,36 @@ class BotRGCN_v3(nn.Module):
         n = self.linear_relu_num_prop(num_prop)
         c = self.linear_relu_cat_prop(cat_prop)
 
-        x = torch.cat((d, t, n, c), dim=1)
-        x = self.linear_relu_input(x)
-        x = self.input_norm(x)
+        x_static = torch.cat((d, t, n, c), dim=1)
+        x_static = self.linear_relu_input(x_static)
+        x_static = self.input_norm(x_static)
 
         # 边类型 → 边特征向量
         edge_attr = self.edge_embedding(edge_type)
 
         # 多层 GAT + 残差连接
-        for i in range(self.num_gnn_layers):
-            x_res = x
-            x = self.gat_layers[i](x, edge_index, edge_attr=edge_attr)
-            x = F.gelu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = x + x_res  # 残差
-            x = self.gat_norms[i](x)
+        if fusion_type != 'no_graph':
+            x = x_static
+            for i in range(self.num_gnn_layers):
+                x_res = x
+                x = self.gat_layers[i](x, edge_index, edge_attr=edge_attr)
+                x = F.gelu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+                x = x + x_res  # 残差
+                x = self.gat_norms[i](x)
+        else:
+            x = x_static
 
-        # 门控融合
-        gate = torch.sigmoid(self.gate_linear(torch.cat((x, t_proj), dim=1)))
-        x_fused = gate * x + (1 - gate) * t_proj
+        # 融合策略 (语义与 v2 一致)
+        if fusion_type == 'no_graph':
+            x_fused = F.gelu(self.mlp_linear(torch.cat((x_static, t_proj), dim=1)))
+        elif fusion_type == 'none':
+            x_fused = x
+        elif fusion_type == 'concat':
+            x_fused = F.gelu(self.mlp_linear(torch.cat((x, t_proj), dim=1)))
+        else:
+            gate = torch.sigmoid(self.gate_linear(torch.cat((x, t_proj), dim=1)))
+            x_fused = gate * x + (1 - gate) * t_proj
 
         x_fused = self.output1(x_fused)
         x_fused = self.output2(x_fused)

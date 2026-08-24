@@ -127,6 +127,12 @@ def main():
                         help="权重计算方式: sqrt(平方根), inv(反比例), manual(手动)")
     parser.add_argument("--use-focal-loss", action="store_true", help="使用 Focal Loss 替代 CrossEntropy")
     parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal Loss 的 gamma 参数")
+    parser.add_argument("--no-graph", action="store_true",
+                        help="消融: 跳过 GNN 层, 仅静态+时序过 MLP (Time-only)")
+    parser.add_argument("--concat-fusion", action="store_true",
+                        help="消融: 用简单拼接融合替代门控融合")
+    parser.add_argument("--variant", type=str, default="",
+                        help="实验变体标签, 写入 results.csv 用于聚合 (如 full/wo_temporal/flat_static)")
     parser.add_argument("--no-temporal", action="store_true",
                         help="置零时序特征 (Only-RGCN 消融实验用)")
     parser.add_argument("--temporal-npz", type=str, default=None,
@@ -172,7 +178,22 @@ def main():
 
     # ------------------- 代码版本标识 -------------------
     git_state = get_git_state()
-    run_name = f"BotRGCN_{args.model}{args.save_suffix}"
+    run_name = f"BotRGCN_{args.model}{args.save_suffix}_s{args.seed}"
+
+    # 融合方式在整个 run 内固定，训练与测试必须一致
+    if args.model == 'pure' and not args.e2e:
+        fusion_mode = 'n/a'  # 纯净基线没有时序通路, 不存在融合
+    elif args.no_graph:
+        fusion_mode = 'no_graph'
+    elif args.no_temporal:
+        fusion_mode = 'none'
+    elif args.concat_fusion:
+        fusion_mode = 'concat'
+    else:
+        fusion_mode = 'gated'
+    print(f"融合模式: {fusion_mode}")
+    # E2E 模型的 forward 不接受 fusion_type
+    fwd_kwargs = {} if args.e2e else {"fusion_type": fusion_mode}
     print(f"代码版本: {git_state}")
     if git_state.endswith("-dirty"):
         print("!!! 警告: 工作区存在未提交改动, 本次结果无法复现, 不要写入论文 !!!")
@@ -527,7 +548,7 @@ def main():
                 ts_input, edge_index, edge_type, return_embeddings=True)
         else:
             output = model(des_tensor, tweets_tensor, num_prop, cat_prop,
-                           ts_input, edge_index, edge_type)
+                           ts_input, edge_index, edge_type, **fwd_kwargs)
 
         loss_cls = loss_fn(output[valid_train_idx], labels[valid_train_idx])
         loss_train = loss_cls
@@ -556,7 +577,7 @@ def main():
         model.eval()
         with torch.no_grad():
             output_val = model(des_tensor, tweets_tensor, num_prop, cat_prop,
-                               ts_input, edge_index, edge_type)
+                               ts_input, edge_index, edge_type, **fwd_kwargs)
             loss_val = loss_fn(output_val[valid_val_idx], labels[valid_val_idx])
             
             preds_val = output_val[valid_val_idx].argmax(dim=1)
@@ -590,7 +611,7 @@ def main():
         model.eval()
         with torch.no_grad():
             output = model(des_tensor, tweets_tensor, num_prop, cat_prop,
-                           ts_input, edge_index, edge_type)
+                           ts_input, edge_index, edge_type, **fwd_kwargs)
 
             test_mask = labels[test_idx] >= 0
             valid_test_idx = test_idx[test_mask]
@@ -626,12 +647,16 @@ def main():
 
             # 追加到实验结果汇总表 (受版本控制, 每行绑定一个 commit)
             append_result_row(args.results_csv, {
+                "dataset": "TwiBot-22",
                 "time": datetime.datetime.now().isoformat(timespec="seconds"),
                 "commit": git_state,
                 "run_name": run_name,
                 "model": "e2e" if args.e2e else args.model,
+                "variant": args.variant or fusion_mode,
+                "fusion": fusion_mode,
                 "seed": args.seed,
                 "no_temporal": int(args.no_temporal),
+                "temporal_source": os.path.basename(temporal_npz_path) if not args.e2e else "e2e_raw",
                 "align_beta": args.align_beta,
                 "seq_len": args.seq_len if args.e2e else "",
                 "ts_layers": args.ts_layers if args.e2e else "",

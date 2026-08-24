@@ -1,6 +1,9 @@
 import os
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import traceback # 确保在所有导入语句之前
+import csv
+import datetime
+import subprocess
 import torch
 from torch import nn
 import random
@@ -9,13 +12,71 @@ import json
 import argparse
 import swanlab
 
-from model import BotRGCN, BotRGCN_v2, BotRGCN_v3
+from model import BotRGCN, BotRGCN_Pure, BotRGCN_v2, BotRGCN_v3
 # from model import BotRGCN_E2E, info_nce_loss
 from utils import accuracy, init_weights
 
 import numpy as np
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 仓库根目录 (Twibot_20/src → 上两级)，实验结果表放这里以便随代码一起版本控制
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+DEFAULT_RESULTS_CSV = os.path.join(REPO_ROOT, "experiments", "results.csv")
+
+
+def set_seed(seed=42):
+    """固定所有随机种子以确保可复现性"""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"随机种子已固定: {seed}")
+
+
+def get_git_state():
+    """
+    返回当前代码的 git 版本标识, 形如 'a1b2c3d' 或 'a1b2c3d-dirty'。
+    带 -dirty 后缀说明运行时工作区存在未提交改动, 该结果不可复现, 不应写入论文。
+    """
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+        return sha + ("-dirty" if dirty else "")
+    except Exception:
+        return "unknown"
+
+
+def append_result_row(csv_path, row):
+    """把一次运行的最终测试指标追加到 results.csv (不存在则建表头)。"""
+    try:
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        print(f"结果已记录: {csv_path}")
+    except Exception as e:
+        print(f"警告: 写入结果表失败 — {e}")
+
+
 parser = argparse.ArgumentParser(description="TwiBot-20 训练")
+parser.add_argument("--model", default="v2", choices=["pure", "v1", "v2", "v3"],
+                    help="模型版本 (pure=纯净BotRGCN基线, 不使用任何时序特征)")
+parser.add_argument("--seed", type=int, default=42, help="随机种子")
+parser.add_argument("--variant", type=str, default="",
+                    help="实验变体标签, 写入 results.csv 用于聚合 (如 full/wo_temporal/flat_static)")
+parser.add_argument("--temporal-npz", type=str, default=None,
+                    help="直接指定时序特征 npz 路径 (优先于 --ts-mode)")
+parser.add_argument("--results-csv", type=str, default=DEFAULT_RESULTS_CSV,
+                    help="实验结果汇总表路径")
 parser.add_argument("--no-temporal", action="store_true",
                     help="置零时序特征 (Only-RGCN 消融实验用)")
 parser.add_argument("--no-graph", action="store_true", 
@@ -64,14 +125,23 @@ parser.add_argument("--epochs", type=int, default=150, help="图网络训练轮�
 args = parser.parse_args()
 
 # ------------------- 参数配置 -------------------
+set_seed(args.seed)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 embedding_size = args.emb_size
 dropout = args.dropout
 lr = args.lr
 weight_decay = args.weight_decay
 epochs = args.epochs
-model_version = 'v2'  # 'v1' = BotRGCN (原始Late Fusion), 'v2' = BotRGCN_v2 (门控融合), 'v3' = BotRGCN_v3 (GAT+残差)
-data_path = os.path.join(os.path.dirname(__file__), 'saved_data', 'twibot20_data.pt')
+model_version = args.model  # 'pure' = 官方基线, 'v1'/'v2'/'v3' = 本文模型
+# 代码位于 Twibot_20/src/, 而数据与产物目录位于 Twibot_20/ 下, 因此以 src 的上级为基准
+BASE_DIR = os.path.dirname(SCRIPT_DIR)
+
+# ------------------- 代码版本标识 -------------------
+git_state = get_git_state()
+run_name = f"BotRGCN_{model_version}{args.save_suffix}_s{args.seed}"
+print(f"代码版本: {git_state}")
+if git_state.endswith("-dirty"):
+    print("!!! 警告: 工作区存在未提交改动, 本次结果无法复现, 不要写入论文 !!!")
 
 # ------------------- 初始化 SwanLab -------------------
 config_dict = vars(args)
@@ -79,14 +149,15 @@ config_dict.update({
     'dataset': 'TwiBot-20',
     'model_version': model_version,
     'weight_decay': weight_decay,
-    'epochs': epochs
+    'epochs': epochs,
+    'git_commit': git_state
 })
 
 swanlab.init(
     project="TwiBot20-BotDetection",
-    name=f"BotRGCN_{model_version}{args.save_suffix}",
+    name=run_name,
     config=config_dict,
-    logdir=os.path.join(os.path.dirname(__file__), "swanlog")
+    logdir=os.path.join(BASE_DIR, "swanlog")
 )
 
 # ------------------- 加载数据 -------------------
@@ -98,12 +169,9 @@ def load_tensor(path):
     return torch.load(path, map_location=device, weights_only=True)
 
 
-# 如果 data_path 是目录，则读取里面的文件
-if os.path.isdir(data_path):
-    processed_dir = os.path.join(data_path, 'Twibot20_processed_data', 'processed_data')
-else:
-    # 原来的多文件目录方式
-    processed_dir = os.path.join(data_path, 'Twibot20_processed_data', 'processed_data')
+processed_dir = os.path.join(BASE_DIR, 'saved_data', 'processed_data')
+if not os.path.isdir(processed_dir):
+    raise SystemExit(f"预处理数据目录不存在: {processed_dir}")
 
 des_tensor = load_tensor(os.path.join(processed_dir, 'des_tensor.pt'))
 tweets_tensor = load_tensor(os.path.join(processed_dir, 'tweets_tensor.pt'))
@@ -115,21 +183,51 @@ labels = load_tensor(os.path.join(processed_dir, 'label.pt'))
 labels = labels.long().squeeze()
 
 # 加载时序特征
-JSON_DATA_DIR = os.path.join(os.path.dirname(__file__), 'Data', 'Twibot-20')
+import pandas as pd
+
+JSON_DATA_DIR = os.path.join(BASE_DIR, 'Data', 'Twibot-20')
+STATIC_CSV_DIR = os.path.join(BASE_DIR, 'tmp', 'tmp_v6')
 num_nodes = des_tensor.shape[0]
 print(f"节点数量: {num_nodes}")
 
-# 构建 user_id → graph_index 映射
-import ijson
+# ---- 构建 user_id → graph_index 映射, 同时得到各 split 的大小 ----
+# 图节点顺序为 train → dev → test → support (与特征提取时的拼接顺序一致)。
+# 优先用官方 JSON; 若缺失, 退回到 feature_extraction 落盘的 *_static.csv
+# (两者用户顺序完全一致, 已核验)。
+SPLIT_ORDER = ['train', 'dev', 'test', 'support']
 ordered_user_ids = []
-for split in ['train', 'dev', 'test', 'support']:
-    split_path = os.path.join(JSON_DATA_DIR, f'{split}.json')
-    if os.path.exists(split_path):
-        with open(split_path, 'r', encoding='utf-8') as f:
-            for user in ijson.items(f, 'item'):
-                ordered_user_ids.append(str(user['ID']))
+split_sizes = {}
+if all(os.path.exists(os.path.join(JSON_DATA_DIR, f'{s}.json')) for s in SPLIT_ORDER[:3]):
+    print(f"划分来源: 官方 JSON ({JSON_DATA_DIR})")
+    import ijson
+    for split in SPLIT_ORDER:
+        split_path = os.path.join(JSON_DATA_DIR, f'{split}.json')
+        n = 0
+        if os.path.exists(split_path):
+            with open(split_path, 'r', encoding='utf-8') as f:
+                for user in ijson.items(f, 'item'):
+                    ordered_user_ids.append(str(user['ID']))
+                    n += 1
+        split_sizes[split] = n
+elif all(os.path.exists(os.path.join(STATIC_CSV_DIR, f'{s}_static.csv')) for s in SPLIT_ORDER):
+    print(f"划分来源: static CSV ({STATIC_CSV_DIR}) — 官方 JSON 缺失, 回退")
+    for split in SPLIT_ORDER:
+        col = pd.read_csv(os.path.join(STATIC_CSV_DIR, f'{split}_static.csv'),
+                          usecols=['user_id'])['user_id'].astype(str).tolist()
+        ordered_user_ids.extend(col)
+        split_sizes[split] = len(col)
+else:
+    raise SystemExit(
+        f"无法确定数据划分: 既找不到官方 JSON ({JSON_DATA_DIR}), "
+        f"也找不到 static CSV ({STATIC_CSV_DIR})")
+
+if len(ordered_user_ids) != num_nodes:
+    raise SystemExit(
+        f"用户顺序表长度 {len(ordered_user_ids)} 与图节点数 {num_nodes} 不一致, "
+        f"时序特征无法正确对齐, 请检查预处理产物。")
+
 id_to_idx_map = {uid: i for i, uid in enumerate(ordered_user_ids)}
-print(f"已构建 {len(ordered_user_ids)} 个用户的有序ID列表。")
+print(f"已构建 {len(ordered_user_ids)} 个用户的有序ID列表。划分大小: {split_sizes}")
 
 # if args.e2e:
 #     # === E2E 模式: 加载原始时间序列矩阵 ===
@@ -168,7 +266,10 @@ print(f"已构建 {len(ordered_user_ids)} 个用户的有序ID列表。")
 # === 原始模式: 加载预计算嵌入 ===
 print(f"=== 加载 Transformer 生成的新时序特征 ({args.ts_mode} 模式) ===")
 raw_ts_tensor = None
-npz_path = os.path.join(os.path.dirname(__file__), 'feature_model_outputs', f'twibot20_transformer_vectors_{args.ts_mode}.npz')
+if args.temporal_npz:
+    npz_path = args.temporal_npz
+else:
+    npz_path = os.path.join(BASE_DIR, 'feature_model_outputs', f'twibot20_transformer_vectors_{args.ts_mode}.npz')
 try:
     if not os.path.exists(npz_path):
         raise FileNotFoundError(f"未在指定路径找到时序特征文件: {npz_path}")
@@ -202,31 +303,25 @@ except Exception as e:
     print("将使用全0代替时序特征！")
     temporal_tensor = torch.zeros((num_nodes, 64), device=device)
 
-# ------------------- 生成随机划分索引 -------------------
 # ------------------- 使用官方固定划分 -------------------
-print("使用 TwiBot-20 官方划分 (train/dev/test)...")
-# 假设脚本在 BotRGCN 目录下运行，数据目录为 Data/Twibot-20
-# 或者使用绝对路径，这里尝试相对路径
-import pandas as pd
+# 图节点按 train → dev → test → support 顺序排列, 因此官方划分就是前三段连续区间。
+# split_sizes 来自上面构建 ordered_user_ids 时的同一数据源, 保证两者绝不会错位。
+# 注意: saved_data/processed_data 下的 train_idx.pt / val_idx.pt / test_idx.pt 是
+# 早期的随机划分 (8278/1182/2366, 索引不连续), 与官方划分不同, 这里一律不使用。
+n_train, n_dev, n_test = split_sizes['train'], split_sizes['dev'], split_sizes['test']
 
-JSON_DATA_DIR = os.path.join(os.path.dirname(__file__), 'Data', 'Twibot-20')
+# 必须保持在 CPU 上，不要 .to(device)
+train_idx = torch.arange(0, n_train)
+val_idx = torch.arange(n_train, n_train + n_dev)
+test_idx = torch.arange(n_train + n_dev, n_train + n_dev + n_test)
 
-try:
-    n_train = len(pd.read_json(os.path.join(JSON_DATA_DIR, 'train.json')))
-    n_dev = len(pd.read_json(os.path.join(JSON_DATA_DIR, 'dev.json')))
-    n_test = len(pd.read_json(os.path.join(JSON_DATA_DIR, 'test.json')))
+n_labeled = labels.shape[0]
+if n_train + n_dev + n_test != n_labeled:
+    raise SystemExit(
+        f"划分总数 {n_train + n_dev + n_test} 与标签数 {n_labeled} 不一致, "
+        f"划分与标签存在错位, 拒绝继续训练。")
 
-    # 必须保持在 CPU 上，不要 .to(device)
-    train_idx = torch.arange(0, n_train)
-    val_idx = torch.arange(n_train, n_train + n_dev)
-    test_idx = torch.arange(n_train + n_dev, n_train + n_dev + n_test)
-
-    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
-
-except Exception as e:
-    print(f"错误：无法读取官方 JSON 文件进行划分 ({e})。")
-    print("请确保 BotRGCN/Data/Twibot-20 目录下有 train.json, dev.json, test.json")
-    exit(1)
+print(f"使用 TwiBot-20 官方划分 — Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
 
 # ------------------- 模型/损失/优化器 -------------------
 # if args.e2e:
@@ -277,12 +372,17 @@ except Exception as e:
 #     print(f"  总参数量: {n_params:,}, 其中 Transformer: {n_ts:,}")
 # else:
 print(f"=== 使用模型: {model_version} ===")
-if model_version == 'v3':
-    model = BotRGCN_v3(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout, time_size=args.feat_d_model).to(device)
+# time_size 必须取实际加载到的时序嵌入维度, 不能用 --feat-d-model 猜
+# (flat_static 等消融的嵌入维度与 Transformer d_model 不同)
+time_size = temporal_tensor.shape[1]
+if model_version == 'pure':
+    model = BotRGCN_Pure(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout).to(device)
+elif model_version == 'v3':
+    model = BotRGCN_v3(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout, time_size=time_size).to(device)
 elif model_version == 'v2':
-    model = BotRGCN_v2(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout, time_size=args.feat_d_model).to(device)
+    model = BotRGCN_v2(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout, time_size=time_size).to(device)
 else:
-    model = BotRGCN(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout).to(device)
+    model = BotRGCN(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout, time_size=time_size).to(device)
 model.apply(init_weights)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"  总参数量: {n_params:,}")
@@ -323,21 +423,25 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, e
 ts_input = temporal_tensor
 use_align = False
 
+# 融合方式在整个 run 内固定，训练与测试必须一致
+if model_version == 'pure':
+    FUSION_MODE = 'n/a'  # 纯净基线没有时序通路, 不存在融合
+elif args.no_graph:
+    FUSION_MODE = 'no_graph'
+elif args.no_temporal:
+    FUSION_MODE = 'none'
+elif args.concat_fusion:
+    FUSION_MODE = 'concat'
+else:
+    FUSION_MODE = 'gated'
+print(f"=== 融合模式: {FUSION_MODE} ===")
+
 
 # ------------------- 训练函数 -------------------
 def train(epoch):
     model.train()
-    
-    # 根据传入参数决定融合方式
-    if args.no_graph:
-        fusion_mode = 'no_graph'
-    elif args.no_temporal:
-        fusion_mode = 'none'
-    elif args.concat_fusion:
-        fusion_mode = 'concat'
-    else:
-        fusion_mode = 'gated'
-    
+    fusion_mode = FUSION_MODE
+
     output = model(des_tensor, tweets_tensor, num_prop, cat_prop,
                    ts_input, edge_index, edge_type, fusion_type=fusion_mode)
 
@@ -378,18 +482,11 @@ def train(epoch):
 
 # ------------------- 测试函数 -------------------
 @torch.no_grad()
-def test():
+def test(epochs_run, best_val_acc):
     model.eval()
     with torch.no_grad():
-        if args.no_graph:
-            fusion_mode = 'no_graph'
-        elif args.no_temporal:
-            fusion_mode = 'none'
-        elif args.concat_fusion:
-            fusion_mode = 'concat'
-        else:
-            fusion_mode = 'gated'
-        
+        fusion_mode = FUSION_MODE
+
         output = model(des_tensor, tweets_tensor, num_prop, cat_prop,
                        ts_input, edge_index, edge_type, fusion_type=fusion_mode)
         loss_test = loss_fn(output[test_idx], labels[test_idx])
@@ -417,6 +514,36 @@ def test():
             "Test/MCC": mcc
         })
 
+        # 追加到实验结果汇总表 (与 TwiBot-22 共用同一张表, 表头必须完全一致)
+        append_result_row(args.results_csv, {
+            "dataset": "TwiBot-20",
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "commit": git_state,
+            "run_name": run_name,
+            "model": model_version,
+            "variant": args.variant or FUSION_MODE,
+            "fusion": FUSION_MODE,
+            "seed": args.seed,
+            "no_temporal": int(args.no_temporal),
+            "temporal_source": os.path.basename(npz_path) if npz_path else "",
+            "align_beta": "",
+            "seq_len": args.feat_seq_len,
+            "ts_layers": args.feat_num_layers,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "dropout": args.dropout,
+            "embedding_size": args.emb_size,
+            "scheduler": "cosine",
+            "class_weight": "none",
+            "epochs_run": epochs_run,
+            "best_val_acc": round(float(best_val_acc), 4),
+            "test_acc": round(acc_test.item(), 4),
+            "precision": round(float(prec), 4),
+            "recall": round(float(rec), 4),
+            "f1": round(float(f1), 4),
+            "mcc": round(float(mcc), 4),
+        })
+
 
 # ------------------- 训练循环 -------------------
 # early_stopping = EarlyStopping(patience=1000, verbose=True, path='best_model.pth') # 已禁用
@@ -424,6 +551,11 @@ def test():
 train_losses = []
 val_losses = []
 best_val_acc = -1.0  # 初始化最佳验证准确率
+epochs_run = 0
+suffix = args.save_suffix if args.save_suffix else ""
+checkpoint_dir = os.path.join(BASE_DIR, 'checkpoints')
+os.makedirs(checkpoint_dir, exist_ok=True)
+best_model_path = os.path.join(checkpoint_dir, f'best_model{suffix}_s{args.seed}.pth')
 
 for epoch in range(epochs):
     # E2E 预热结束: 解冻 Transformer
@@ -439,6 +571,7 @@ for epoch in range(epochs):
     #     print(f"  Transformer lr 恢复为 {lr * args.ts_lr_scale:.2e}")
     #     print(f"  best_val_acc 已重置\n")
 
+    epochs_run = epoch + 1
     train_loss, val_loss, acc_val = train(epoch) # train函数需要返回acc_val
     train_losses.append(train_loss)
     val_losses.append(val_loss)
@@ -450,15 +583,8 @@ for epoch in range(epochs):
     # 基于验证准确率检查并保存最佳模型
     if acc_val > best_val_acc:
         best_val_acc = acc_val
-        suffix = args.save_suffix if args.save_suffix else ""
-        
-        # 确保 checkpoints 文件夹存在
-        checkpoint_dir = os.path.join(os.path.dirname(__file__), 'checkpoints')
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        best_model_path = os.path.join(checkpoint_dir, f'best_model{suffix}.pth')
         torch.save(model.state_dict(), best_model_path)
-        print(f"Validation accuracy improved. Saving model to checkpoints/best_model{suffix}.pth (acc: {acc_val:.4f})")
+        print(f"Validation accuracy improved. Saving model to {best_model_path} (acc: {acc_val:.4f})")
 
 
 # Plot loss
@@ -476,9 +602,8 @@ for epoch in range(epochs):
 # print(f"Loss plot saved to {plot_path}")
 
 # Load the best model
-best_model_path = os.path.join(os.path.dirname(__file__), 'checkpoints', f'best_model{suffix}.pth')
 model.load_state_dict(torch.load(best_model_path, weights_only=True))
 
-test()
+test(epochs_run, best_val_acc)
 
 swanlab.finish()

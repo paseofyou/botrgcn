@@ -51,7 +51,8 @@ class BotRGCN(nn.Module):
         )
         self.linear_output2 = nn.Linear(embedding_dimension, 2)
 
-    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type):
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type,
+                fusion_type=None):
         # Normalize temporal features first
         time_feature = self.time_norm(time_feature)
 
@@ -77,6 +78,57 @@ class BotRGCN(nn.Module):
         x = self.linear_relu_output1(x)
         x = self.linear_output2(x)
 
+        return x
+
+
+class BotRGCN_Pure(nn.Module):
+    """
+    纯净 BotRGCN 基线（论文表1的 reproduction 行）。
+    仅使用图结构 + 静态四模态，不含任何时序通路。
+
+    与官方实现对齐的要点：
+      1. 只有一个 RGCNConv，被调用两次（权重共享），而非两个独立层
+      2. 激活函数为 LeakyReLU
+      3. 不含 input_norm / time_norm 等额外归一化层
+      4. 输出层输入维度为 emb（非 emb + time_size）
+
+    forward 保留 time_feature / fusion_type 形参仅为与训练循环的调用签名兼容，内部完全不使用。
+    """
+
+    def __init__(self, des_size=768, tweet_size=768, num_prop_size=6, cat_prop_size=11,
+                 embedding_dimension=64, dropout=0.3):
+        super(BotRGCN_Pure, self).__init__()
+        self.dropout = dropout
+        emb = embedding_dimension
+
+        self.linear_relu_des = nn.Sequential(nn.Linear(des_size, emb // 4), nn.LeakyReLU())
+        self.linear_relu_tweet = nn.Sequential(nn.Linear(tweet_size, emb // 4), nn.LeakyReLU())
+        self.linear_relu_num_prop = nn.Sequential(nn.Linear(num_prop_size, emb // 4), nn.LeakyReLU())
+        self.linear_relu_cat_prop = nn.Sequential(nn.Linear(cat_prop_size, emb // 4), nn.LeakyReLU())
+
+        self.linear_relu_input = nn.Sequential(nn.Linear(emb, emb), nn.LeakyReLU())
+
+        self.rgcn = RGCNConv(emb, emb, num_relations=2)
+
+        self.linear_relu_output1 = nn.Sequential(nn.Linear(emb, emb), nn.LeakyReLU())
+        self.linear_output2 = nn.Linear(emb, 2)
+
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type,
+                fusion_type=None):
+        d = self.linear_relu_des(des)
+        t = self.linear_relu_tweet(tweet)
+        n = self.linear_relu_num_prop(num_prop)
+        c = self.linear_relu_cat_prop(cat_prop)
+
+        x = torch.cat((d, t, n, c), dim=1)
+        x = self.linear_relu_input(x)
+
+        x = self.rgcn(x, edge_index, edge_type)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.rgcn(x, edge_index, edge_type)
+
+        x = self.linear_relu_output1(x)
+        x = self.linear_output2(x)
         return x
 
 
@@ -219,11 +271,15 @@ class BotRGCN_v3(nn.Module):
         # --- 门控融合 (同 v2) ---
         self.gate_linear = nn.Linear(emb * 2, emb)
 
+        # --- MLP 融合 (用于 w/o Graph 和 Concat 消融, 同 v2) ---
+        self.mlp_linear = nn.Linear(emb * 2, emb)
+
         # --- 输出层 ---
         self.output1 = nn.Sequential(nn.Linear(emb, emb), nn.LeakyReLU())
         self.output2 = nn.Linear(emb, 2)
 
-    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type):
+    def forward(self, des, tweet, num_prop, cat_prop, time_feature, edge_index, edge_type,
+                fusion_type='gated'):
         t_proj = self.time_proj(time_feature)
 
         d = self.linear_relu_des(des)
@@ -231,25 +287,36 @@ class BotRGCN_v3(nn.Module):
         n = self.linear_relu_num_prop(num_prop)
         c = self.linear_relu_cat_prop(cat_prop)
 
-        x = torch.cat((d, t, n, c), dim=1)
-        x = self.linear_relu_input(x)
-        x = self.input_norm(x)
+        x_static = torch.cat((d, t, n, c), dim=1)
+        x_static = self.linear_relu_input(x_static)
+        x_static = self.input_norm(x_static)
 
         # 边类型 → 边特征向量
         edge_attr = self.edge_embedding(edge_type)
 
         # 多层 GAT + 残差连接
-        for i in range(self.num_gnn_layers):
-            x_res = x
-            x = self.gat_layers[i](x, edge_index, edge_attr=edge_attr)
-            x = F.elu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = x + x_res  # 残差
-            x = self.gat_norms[i](x)
+        if fusion_type != 'no_graph':
+            x = x_static
+            for i in range(self.num_gnn_layers):
+                x_res = x
+                x = self.gat_layers[i](x, edge_index, edge_attr=edge_attr)
+                x = F.elu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+                x = x + x_res  # 残差
+                x = self.gat_norms[i](x)
+        else:
+            x = x_static
 
-        # 门控融合
-        gate = torch.sigmoid(self.gate_linear(torch.cat((x, t_proj), dim=1)))
-        x_fused = gate * x + (1 - gate) * t_proj
+        # 融合策略 (语义与 v2 一致)
+        if fusion_type == 'no_graph':
+            x_fused = F.leaky_relu(self.mlp_linear(torch.cat((x_static, t_proj), dim=1)))
+        elif fusion_type == 'none':
+            x_fused = x
+        elif fusion_type == 'concat':
+            x_fused = F.leaky_relu(self.mlp_linear(torch.cat((x, t_proj), dim=1)))
+        else:
+            gate = torch.sigmoid(self.gate_linear(torch.cat((x, t_proj), dim=1)))
+            x_fused = gate * x + (1 - gate) * t_proj
 
         x_fused = self.output1(x_fused)
         x_fused = self.output2(x_fused)
