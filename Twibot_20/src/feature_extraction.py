@@ -30,8 +30,11 @@ from sklearn.metrics import accuracy_score, f1_score
 # ----------------------
 # 配置
 # ----------------------
-CUR_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(CUR_DIR, "Data", "Twibot-20")
+# 代码现在位于 Twibot_20/src/，而数据/产物位于 Twibot_20/ 下
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(SCRIPT_DIR)
+DATA_DIR = os.path.join(BASE_DIR, "Data", "Twibot-20")
+FEATURE_OUTPUT_DIR = os.path.join(BASE_DIR, "feature_model_outputs")
 TWITTER_DATE_FORMAT = '%a %b %d %H:%M:%S +0000 %Y'
 CRAWL_DATE_STR = '2020-09-01'
 CRAWL_DATE = datetime.datetime.strptime(CRAWL_DATE_STR, '%Y-%m-%d')
@@ -46,11 +49,12 @@ LEARNING_RATE = 1e-4
 BATCH_SIZE = 128
 NUM_EPOCHS = 100
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_SAVE_PATH = os.path.join(CUR_DIR, "feature_model_outputs", "best_timeseries_model.pt")
+MODEL_SAVE_PATH = os.path.join(FEATURE_OUTPUT_DIR, "best_timeseries_model.pt")
 
 # 临时文件 (每个分割)
-TMP_DIR = os.path.join(CUR_DIR, "tmp_v6")
+TMP_DIR = os.path.join(BASE_DIR, "tmp", "tmp_v6")
 os.makedirs(TMP_DIR, exist_ok=True)
+os.makedirs(FEATURE_OUTPUT_DIR, exist_ok=True)
 
 # 日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -724,7 +728,7 @@ def generate_flat_static_vectors():
     logging.info(f"Total vectors: {len(all_vectors)}")
     user_ids_ordered = list(all_vectors.keys())
     vectors = np.stack([all_vectors[uid] for uid in user_ids_ordered], axis=0).astype(np.float32)
-    out_path = os.path.join(CUR_DIR, "feature_model_outputs", "twibot20_transformer_vectors_flat_static.npz")
+    out_path = os.path.join(FEATURE_OUTPUT_DIR, "twibot20_transformer_vectors_flat_static.npz")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     np.savez_compressed(out_path, vectors=vectors, user_ids=np.array(user_ids_ordered, dtype=object))
     logging.info(f"Flat-Static vectors saved to: {out_path} (形状={vectors.shape})")
@@ -745,13 +749,13 @@ def main(temporal_mode="auto", seq_len=None, num_layers=None, d_model=None, n_he
     # 参数化目录: 不同 T/L 组合保存到不同子目录
     if suffix_override is not None:
         suffix = suffix_override
-        tmp_dir = os.path.join(CUR_DIR, f"tmp_v6{suffix}")
+        tmp_dir = os.path.join(TMP_DIR, f"{suffix.strip('_')}")
         os.makedirs(tmp_dir, exist_ok=True)
     elif SEQ_LEN == 32 and NUM_ENCODER_LAYERS == 2:
         tmp_dir = TMP_DIR
         suffix = ""
     else:
-        tmp_dir = os.path.join(CUR_DIR, f"tmp_v6_T{SEQ_LEN}")
+        tmp_dir = os.path.join(TMP_DIR, f"T{SEQ_LEN}_L{NUM_ENCODER_LAYERS}")
         suffix = f"_T{SEQ_LEN}_L{NUM_ENCODER_LAYERS}"
         os.makedirs(tmp_dir, exist_ok=True)
 
@@ -795,7 +799,7 @@ def main(temporal_mode="auto", seq_len=None, num_layers=None, d_model=None, n_he
 
     # 根据 temporal_mode 动态生成模型权重文件名
     mode_str = temporal_mode if temporal_mode in ["anchor", "pseudo"] else "auto"
-    model_save_path = os.path.join(CUR_DIR, "feature_model_outputs", f"best_timeseries_model_{mode_str}{suffix}.pt")
+    model_save_path = os.path.join(FEATURE_OUTPUT_DIR, f"best_timeseries_model_{mode_str}{suffix}.pt")
     os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
     encoder = TimeSeriesEncoder(in_dim=in_dim, d_model=D_MODEL, nhead=N_HEAD, num_layers=NUM_ENCODER_LAYERS, dropout=DROPOUT)
     model = BotClassifier(encoder).to(DEVICE)
@@ -840,7 +844,7 @@ def main(temporal_mode="auto", seq_len=None, num_layers=None, d_model=None, n_he
     #     plt.ylabel('Loss')
     #     plt.legend()
     #     plt.grid(True)
-    #     plot_save_path = os.path.join(CUR_DIR, "feature_model_outputs", "loss_plot_feature_extraction.png")
+    #     plot_save_path = os.path.join(FEATURE_OUTPUT_DIR, "loss_plot_feature_extraction.png")
     #     os.makedirs(os.path.dirname(plot_save_path), exist_ok=True)
     #     plt.savefig(plot_save_path)
     #     logging.info(f"损失曲线图已保存至: {plot_save_path}")
@@ -889,7 +893,7 @@ def main(temporal_mode="auto", seq_len=None, num_layers=None, d_model=None, n_he
     else:
         out_name = f"twibot20_transformer_vectors_{mode_str}.npz"
         
-    out_path = os.path.join(CUR_DIR, "feature_model_outputs", out_name)
+    out_path = os.path.join(FEATURE_OUTPUT_DIR, out_name)
     np.savez_compressed(out_path, vectors=vectors, user_ids=np.array(user_ids_ordered, dtype=object))
     logging.info(f"Saved embeddings to: {out_path} (形状={vectors.shape})")
 
