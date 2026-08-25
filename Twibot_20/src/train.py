@@ -271,44 +271,50 @@ print(f"已构建 {len(ordered_user_ids)} 个用户的有序ID列表。划分大
 #     temporal_tensor = None
 # else:
 # === 原始模式: 加载预计算嵌入 ===
-print(f"=== 加载 Transformer 生成的新时序特征 ({args.ts_mode} 模式) ===")
 raw_ts_tensor = None
-if args.temporal_npz:
-    npz_path = args.temporal_npz
+if args.model == 'pure':
+    # === 纯净基线: 完全不涉及时序, 连 npz 都不读 ===
+    print("=== 纯净 BotRGCN 模式: 不加载任何时序特征 ===")
+    temporal_tensor = None
+    npz_path = ""
 else:
-    npz_path = os.path.join(BASE_DIR, 'feature_model_outputs', f'twibot20_transformer_vectors_{args.ts_mode}.npz')
-try:
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"未在指定路径找到时序特征文件: {npz_path}")
+    print(f"=== 加载 Transformer 生成的新时序特征 ({args.ts_mode} 模式) ===")
+    if args.temporal_npz:
+        npz_path = args.temporal_npz
+    else:
+        npz_path = os.path.join(BASE_DIR, 'feature_model_outputs', f'twibot20_transformer_vectors_{args.ts_mode}.npz')
+    try:
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"未在指定路径找到时序特征文件: {npz_path}")
 
-    npz_data = np.load(npz_path, allow_pickle=True)
-    npz_vectors = npz_data['vectors']
-    npz_user_ids = [str(uid) for uid in npz_data['user_ids']]
-    print(f"已从 {npz_path} 加载 {len(npz_user_ids)} 个用户的向量。")
+        npz_data = np.load(npz_path, allow_pickle=True)
+        npz_vectors = npz_data['vectors']
+        npz_user_ids = [str(uid) for uid in npz_data['user_ids']]
+        print(f"已从 {npz_path} 加载 {len(npz_user_ids)} 个用户的向量。")
 
-    embedding_dim = npz_vectors.shape[1]
-    aligned_temporal_tensor = torch.zeros((len(ordered_user_ids), embedding_dim), device=device)
-    unmapped_count = 0
-    for i, user_id in enumerate(npz_user_ids):
-        target_idx = id_to_idx_map.get(str(user_id))
-        if target_idx is not None:
-            aligned_temporal_tensor[target_idx] = torch.from_numpy(npz_vectors[i]).to(device)
-        else:
-            unmapped_count += 1
-    if unmapped_count > 0:
-        print(f"警告: {unmapped_count} 个来自.npz的向量无法在目标张量中找到映射。")
-    temporal_tensor = aligned_temporal_tensor
-    print(f"成功对齐时序特征，最终形状: {temporal_tensor.shape}")
+        embedding_dim = npz_vectors.shape[1]
+        aligned_temporal_tensor = torch.zeros((len(ordered_user_ids), embedding_dim), device=device)
+        unmapped_count = 0
+        for i, user_id in enumerate(npz_user_ids):
+            target_idx = id_to_idx_map.get(str(user_id))
+            if target_idx is not None:
+                aligned_temporal_tensor[target_idx] = torch.from_numpy(npz_vectors[i]).to(device)
+            else:
+                unmapped_count += 1
+        if unmapped_count > 0:
+            print(f"警告: {unmapped_count} 个来自.npz的向量无法在目标张量中找到映射。")
+        temporal_tensor = aligned_temporal_tensor
+        print(f"成功对齐时序特征，最终形状: {temporal_tensor.shape}")
 
-    if args.no_temporal:
-        print("*** --no-temporal: 时序特征已置零 (Only-RGCN 消融模式) ***")
-        temporal_tensor = torch.zeros_like(temporal_tensor)
+        if args.no_temporal:
+            print("*** --no-temporal: 时序特征已置零 (Only-RGCN 消融模式) ***")
+            temporal_tensor = torch.zeros_like(temporal_tensor)
 
-except Exception as e:
-    print(f"错误: 加载或对齐新的时序特征失败。")
-    traceback.print_exc()
-    print("将使用全0代替时序特征！")
-    temporal_tensor = torch.zeros((num_nodes, 64), device=device)
+    except Exception as e:
+        print(f"错误: 加载或对齐新的时序特征失败。")
+        traceback.print_exc()
+        print("将使用全0代替时序特征！")
+        temporal_tensor = torch.zeros((num_nodes, 64), device=device)
 
 # ------------------- 使用官方固定划分 -------------------
 # 图节点按 train → dev → test → support 顺序排列, 因此官方划分就是前三段连续区间。
@@ -381,7 +387,7 @@ print(f"使用 TwiBot-20 官方划分 — Train: {len(train_idx)}, Val: {len(val
 print(f"=== 使用模型: {model_version} ===")
 # time_size 必须取实际加载到的时序嵌入维度, 不能用 --feat-d-model 猜
 # (flat_static 等消融的嵌入维度与 Transformer d_model 不同)
-time_size = temporal_tensor.shape[1]
+time_size = temporal_tensor.shape[1] if temporal_tensor is not None else 0
 if model_version == 'pure':
     model = BotRGCN_Pure(num_prop_size=num_prop.shape[1], cat_prop_size=cat_prop.shape[1], embedding_dimension=embedding_size, dropout=dropout).to(device)
 elif model_version == 'v3':
