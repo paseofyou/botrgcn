@@ -75,15 +75,22 @@ def get_git_state():
     """
     返回当前代码的 git 版本标识, 形如 'a1b2c3d' 或 'a1b2c3d-dirty'。
     带 -dirty 后缀说明运行时工作区存在未提交改动, 该结果不可复现, 不应写入论文。
+    训练产物(swanlog/, checkpoints/, experiments/results.csv) 不计入 dirty。
     """
     try:
         sha = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()
-        dirty = subprocess.check_output(
+        status = subprocess.check_output(
             ["git", "status", "--porcelain"],
             cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()
-        return sha + ("-dirty" if dirty else "")
+        if not status:
+            return sha
+        # 忽略训练产物, 只看真正的代码改动
+        ignore_paths = {"experiments/results.csv", "swanlog", "checkpoints", "Twibot_20/swanlog",
+                        "Twibot_20/checkpoints", "Twibot_22/swanlog", "Twibot_22/checkpoints"}
+        changed = [line for line in status.splitlines() if line.split()[-1] not in ignore_paths]
+        return sha + ("-dirty" if changed else "")
     except Exception:
         return "unknown"
 
