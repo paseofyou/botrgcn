@@ -759,7 +759,7 @@ def build_real_ts_matrices(data_dir, tmp_dir, seq_len=SEQ_LEN, mode="real", drop
 # =====================================================
 # 主管道: Transformer 训练 + 嵌入提取
 # =====================================================
-def main(temporal_mode, data_dir, work_dir, drop_rate=0.0):
+def main(temporal_mode, data_dir, work_dir, drop_rate=0.0, patience=0, select_metric="acc"):
     mode_suffix = temporal_mode  # "real" or "hybrid"
     if drop_rate > 0:
         drop_tag = f"_drop{drop_rate:.2f}".replace(".", "")
@@ -821,9 +821,14 @@ def main(temporal_mode, data_dir, work_dir, drop_rate=0.0):
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # 3) 训练 (F1 选模 + early stopping)
-    PATIENCE = 15
-    best_f1 = -1.0
+    # 3) 训练 (选模指标可配置; patience<=0 表示禁用早停, 与 TwiBot-20 特征提取保持一致)
+    PATIENCE = patience
+    logging.info(f"选模指标: val {select_metric}")
+    if PATIENCE > 0:
+        logging.info(f"早停已启用: patience={PATIENCE} (基于 val {select_metric})")
+    else:
+        logging.info(f"早停已禁用: 固定训练 {NUM_EPOCHS} epochs, 仍按 val {select_metric} 选最佳模型")
+    best_score = -1.0
     patience_counter = 0
     for epoch in range(NUM_EPOCHS):
         logging.info(f"Epoch {epoch + 1}/{NUM_EPOCHS}")
@@ -833,15 +838,16 @@ def main(temporal_mode, data_dir, work_dir, drop_rate=0.0):
         if dev_loader:
             val_loss, val_acc, val_f1 = evaluate(model, dev_loader, criterion, DEVICE)
             logging.info(f"  val loss: {val_loss:.4f} | val acc: {val_acc:.4f} | val F1: {val_f1:.4f}")
-            if val_f1 > best_f1:
-                best_f1 = val_f1
+            score = val_acc if select_metric == "acc" else val_f1
+            if score > best_score:
+                best_score = score
                 patience_counter = 0
                 torch.save(model.state_dict(), model_save_path)
-                logging.info(f"  ★ 新最佳模型 (F1={val_f1:.4f}, acc={val_acc:.4f})")
+                logging.info(f"  ★ 新最佳模型 (acc={val_acc:.4f}, F1={val_f1:.4f})")
             else:
                 patience_counter += 1
-                if patience_counter >= PATIENCE:
-                    logging.info(f"  Early stopping: {PATIENCE} epochs 无 F1 提升")
+                if PATIENCE > 0 and patience_counter >= PATIENCE:
+                    logging.info(f"  Early stopping: {PATIENCE} epochs 无 {select_metric} 提升")
                     break
         else:
             torch.save(model.state_dict(), model_save_path)
@@ -886,6 +892,12 @@ if __name__ == "__main__":
     parser.add_argument("--drop-rate", type=float, default=0.0,
                         help="随机丢弃推文时间戳的比例 (0.0=不丢弃, 0.75=保留 25%%). "
                              "用于时间信息缺失敏感性实验 (\u00a75.7)")
+    parser.add_argument("--patience", type=int, default=0,
+                        help="早停耐心值 (基于 val F1)。<=0 表示禁用早停, "
+                             "固定训练满 epochs (默认, 与 TwiBot-20 特征提取一致)")
+    parser.add_argument("--select-metric", default="acc", choices=["acc", "f1"],
+                        help="时序编码器选模指标 (默认 acc, 与 TwiBot-20 特征提取一致)")
     args = parser.parse_args()
     main(temporal_mode=args.mode, data_dir=args.data_dir, work_dir=args.work_dir,
-         drop_rate=args.drop_rate)
+         drop_rate=args.drop_rate, patience=args.patience,
+         select_metric=args.select_metric)
