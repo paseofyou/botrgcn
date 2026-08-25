@@ -16,13 +16,15 @@ import argparse
 import numpy as np
 
 
-def generate_flat_embed(work_dir, dataset="twibot22", embed_dim=64):
+def generate_flat_embed(work_dir, dataset="twibot22", embed_dim=64, tmp_dir=None):
     if dataset == "twibot22":
-        tmp_dir = os.path.join(work_dir, "tmp_twibot22")
+        default_tmp = os.path.join(work_dir, "tmp_twibot22")
         out_name = "twibot22_transformer_vectors_flat.npz"
     else:
-        tmp_dir = os.path.join(work_dir, "tmp_v6")
+        default_tmp = os.path.join(work_dir, "tmp_v6")
         out_name = "twibot20_transformer_vectors_flat.npz"
+    tmp_dir = tmp_dir or default_tmp
+    print(f"矩阵来源: {tmp_dir}")
 
     out_dir = os.path.join(work_dir, "feature_model_outputs")
     os.makedirs(out_dir, exist_ok=True)
@@ -65,5 +67,7 @@ if __name__ == "__main__":
                         help="数据集 (决定 tmp 目录和输出文件名)")
     parser.add_argument("--embed-dim", type=int, default=64,
                         help="嵌入维度 (默认 64)")
+    parser.add_argument("--tmp-dir", default=None,
+                        help="矩阵所在目录, 覆盖默认值 (如 $WORK/tmp_twibot22_real)")
     args = parser.parse_args()
-    generate_flat_embed(args.work_dir, args.dataset, args.embed_dim)
+    generate_flat_embed(args.work_dir, args.dataset, args.embed_dim, args.tmp_dir)
