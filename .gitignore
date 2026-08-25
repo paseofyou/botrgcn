@@ -6,6 +6,8 @@
 saved_data/
 checkpoints/
 feature_model_outputs/
+Data/
+data/
 tmp/
 tmp_twibot22*/
 tmp_v6*/
