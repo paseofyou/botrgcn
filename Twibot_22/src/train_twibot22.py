@@ -688,7 +688,9 @@ def main():
     patience_counter = 0
     epochs_run = 0
     suffix = args.save_suffix if args.save_suffix else ""
-    best_model_path = os.path.join(args.work_dir, f"best_model_twibot22{suffix}.pth")
+    checkpoint_dir = os.path.join(args.work_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    best_model_path = os.path.join(checkpoint_dir, f"best_model_twibot22{suffix}_s{args.seed}.pth")
 
     for epoch in range(args.epochs):
         # E2E 预热结束: 解冻 Transformer
