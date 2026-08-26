@@ -520,13 +520,12 @@ def main(temporal_mode, data_dir, work_dir, seq_len=None, num_layers=None):
     seq_len = seq_len or SEQ_LEN
     num_layers = num_layers or NUM_ENCODER_LAYERS
 
-    # 参数化目录: 不同 T/L 组合保存到不同子目录
+    # 参数化目录: 不同 mode / T / L 组合保存到不同子目录, 避免互相覆盖
     if seq_len == SEQ_LEN and num_layers == NUM_ENCODER_LAYERS:
-        tmp_dir = os.path.join(work_dir, "tmp_twibot22")
-        suffix = ""
+        suffix = f"_{temporal_mode}"
     else:
-        tmp_dir = os.path.join(work_dir, f"tmp_twibot22_T{seq_len}")
-        suffix = f"_T{seq_len}_L{num_layers}"
+        suffix = f"_{temporal_mode}_T{seq_len}_L{num_layers}"
+    tmp_dir = os.path.join(work_dir, f"tmp_twibot22{suffix}")
 
     model_save_dir = os.path.join(work_dir, "feature_model_outputs")
     model_save_path = os.path.join(model_save_dir, f"best_timeseries_model_twibot22{suffix}.pt")
@@ -563,10 +562,20 @@ def main(temporal_mode, data_dir, work_dir, seq_len=None, num_layers=None):
     in_dim = tmp['matrices'].shape[2]
     logging.info(f"输入维度: {in_dim}")
 
+    # 类别权重 (sqrt策略, 与 feature_extraction_twibot22_real.py 完全一致,
+    # 否则 pseudo / real 的时序编码器训练目标不同, 两者不可比)
+    train_labels = train_dataset.labels
+    n_neg = int((train_labels == 0).sum())
+    n_pos = int((train_labels == 1).sum())
+    sqrt_weight = float(np.sqrt(n_neg / n_pos)) if n_pos > 0 else 1.0
+    logging.info(f"类别分布: neg={n_neg}, pos={n_pos}, "
+                 f"raw_ratio={n_neg / (n_pos + 1e-9):.2f}, sqrt_pos_weight={sqrt_weight:.4f}")
+
     encoder = TimeSeriesEncoder(in_dim=in_dim, d_model=D_MODEL, nhead=N_HEAD,
                                 num_layers=num_layers, dropout=DROPOUT)
     model = BotClassifier(encoder).to(DEVICE)
-    criterion = nn.BCEWithLogitsLoss()
+    pos_weight = torch.tensor([sqrt_weight], dtype=torch.float32).to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     # 3) 训练
@@ -610,10 +619,7 @@ def main(temporal_mode, data_dir, work_dir, seq_len=None, num_layers=None):
     logging.info(f"总嵌入数: {len(all_embeddings)}")
     user_ids_ordered = list(all_embeddings.keys())
     vectors = np.stack([all_embeddings[uid] for uid in user_ids_ordered], axis=0).astype(np.float32)
-    if suffix:
-        out_name = f"twibot22_transformer_vectors{suffix}.npz"
-    else:
-        out_name = "twibot22_transformer_vectors.npz"
+    out_name = f"twibot22_transformer_vectors{suffix}.npz"
     out_path = os.path.join(model_save_dir, out_name)
     np.savez_compressed(out_path, vectors=vectors, user_ids=np.array(user_ids_ordered, dtype=object))
     logging.info(f"嵌入已保存: {out_path} (形状={vectors.shape})")
